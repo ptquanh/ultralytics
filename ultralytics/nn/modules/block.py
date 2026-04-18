@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -2071,3 +2072,136 @@ class RealNVP(nn.Module):
             self.float()
         z, log_det = self.backward_p(x)
         return self.prior.log_prob(z) + log_det
+
+# ============================================================================
+# LUA KHOE AI - CUSTOM MODULES (V6)
+# ============================================================================
+class SEM(nn.Module):
+    def __init__(self, c1, c2, scale_factor=8):
+        super().__init__()
+        self.scale_factor = scale_factor
+        self.compress = nn.Sequential(
+            nn.Conv2d(c1, c1, kernel_size=3, padding=1, groups=c1, bias=False),
+            nn.BatchNorm2d(c1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(c1, c2, kernel_size=1, bias=False),
+            nn.BatchNorm2d(c2),
+        )
+        self.channel_attn = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c2, c2 // 4, 1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(c2 // 4, c2, 1),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, x):
+        x = self.compress(x)
+        attn = self.channel_attn(x)
+        x = x * attn
+        x = F.interpolate(x, scale_factor=self.scale_factor, mode='bilinear', align_corners=False)
+        return x
+
+class BRA_Wrapper(nn.Module):
+    def __init__(self, c, num_heads=4, topk=4, region_size=8):
+        super().__init__()
+        assert c % num_heads == 0, f"Channels {c} must be divisible by num_heads {num_heads}"
+        self.num_heads = num_heads
+        self.head_dim = c // num_heads
+        self.region_size = region_size
+        self.scale = self.head_dim ** -0.5
+        
+        self.qkv = nn.Linear(c, c * 3, bias=False)
+        self.proj = nn.Linear(c, c)
+        
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x_attn = x.permute(0, 2, 3, 1).contiguous()
+        
+        num_regions_h = H // self.region_size
+        num_regions_w = W // self.region_size
+        num_regions = num_regions_h * num_regions_w
+        
+        x_regions = x_attn.view(B, num_regions_h, self.region_size, num_regions_w, self.region_size, C)
+        x_regions = x_regions.permute(0, 1, 3, 2, 4, 5).contiguous()
+        x_regions = x_regions.view(B * num_regions, self.region_size * self.region_size, C)
+        
+        qkv = self.qkv(x_regions).reshape(B * num_regions, -1, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        
+        out = (attn @ v).transpose(1, 2).reshape(B * num_regions, -1, C)
+        out = self.proj(out)
+        
+        out = out.view(B, num_regions_h, num_regions_w, self.region_size, self.region_size, C)
+        out = out.permute(0, 1, 3, 2, 4, 5).contiguous()
+        out = out.view(B, H, W, C)
+        
+        out = out.permute(0, 3, 1, 2).contiguous()
+        return out
+
+class AKConv(nn.Module):
+    def __init__(self, c1, c2, k=5, s=1, p=None, g=1):
+        super().__init__()
+        self.num_param = k * k
+        self.stride = s
+        self.padding = (k - 1) // 2 if p is None else p
+        
+        self.offset_conv = nn.Sequential(
+            nn.Conv2d(c1, c1, kernel_size=3, padding=1, groups=c1, bias=False),
+            nn.BatchNorm2d(c1),
+            nn.GELU(),
+            nn.Conv2d(c1, 2 * self.num_param, kernel_size=1, bias=True)
+        )
+        nn.init.constant_(self.offset_conv[-1].weight, 0)
+        nn.init.constant_(self.offset_conv[-1].bias, 0)
+        
+        self.weight = nn.Parameter(torch.randn(c2, c1 // g, self.num_param))
+        nn.init.kaiming_normal_(self.weight, mode='fan_out', nonlinearity='relu')
+        self.groups = g
+        
+    def forward(self, x):
+        B, C, H, W = x.shape
+        offset = self.offset_conv(x)
+        offset = torch.tanh(offset) * 2.0
+        
+        k = int(math.sqrt(self.num_param))
+        p = k // 2
+        grid = torch.stack(torch.meshgrid(
+            torch.arange(-p, p + 1, device=x.device),
+            torch.arange(-p, p + 1, device=x.device),
+            indexing='ij'
+        ), dim=-1).float().reshape(-1, 2)
+        
+        offset = offset.view(B, self.num_param, 2, H, W)
+        locations = grid[None, :, :, None, None] + offset
+        
+        locations[..., 0, :, :] = 2.0 * locations[..., 0, :, :] / (W - 1) - 1.0
+        locations[..., 1, :, :] = 2.0 * locations[..., 1, :, :] / (H - 1) - 1.0
+        locations = locations.permute(0, 3, 4, 1, 2).contiguous()
+        
+        sampled_features = []
+        for i in range(self.num_param):
+            sampled = F.grid_sample(x, locations[..., i, :], mode='bilinear', padding_mode='zeros', align_corners=True)
+            sampled_features.append(sampled)
+            
+        sampled_features = torch.stack(sampled_features, dim=-1)
+        sampled_features = sampled_features.view(B, C, H * W, self.num_param).permute(0, 2, 1, 3)
+        out = torch.einsum('bhci,oci->bho', sampled_features, self.weight)
+        return out.view(B, H, W, -1).permute(0, 3, 1, 2)
+
+class C2f_AKConv(nn.Module):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__()
+        self.c = int(c2 * e)
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(n))
+        self.cv2 = AKConv(self.c * (2 + n), c2, k=5, s=1)
+        
+    def forward(self, x):
+        y = list(self.cv1(x).split((self.c, self.c), 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))

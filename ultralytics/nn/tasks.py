@@ -10,6 +10,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
+from ultralytics.nn.modules.block import SEM, BRA_Wrapper, C2f_AKConv
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
     AIFI,
@@ -1714,6 +1715,20 @@ def parse_model(d, ch, verbose=True):
             c2 = args[0]
             c1 = ch[f]
             args = [*args[1:]]
+        elif m is SEM:
+            c1, c2 = ch[f], args[0]
+            c2 = make_divisible(min(c2, max_channels) * width, 8)
+            args = [c1, c2, args[1]]
+        elif m is BRA_Wrapper:
+            c1, c2 = ch[f], args[0]
+            c2 = c1
+            args = [c1] + args[1:]
+        elif m is C2f_AKConv:
+            c1, c2 = ch[f], args[0]
+            c2 = make_divisible(min(c2, max_channels) * width, 8)
+            args = [c1, c2, *args[1:]]
+            args.insert(2, n)
+            n = 1
         else:
             c2 = ch[f]
 
