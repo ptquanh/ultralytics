@@ -2174,7 +2174,7 @@ class AKConv(nn.Module):
             torch.arange(-p, p + 1, device=x.device),
             torch.arange(-p, p + 1, device=x.device),
             indexing='ij'
-        ), dim=-1).float().reshape(-1, 2)
+        ), dim=-1).to(x.dtype).reshape(-1, 2)
         
         offset = offset.view(B, self.num_param, 2, H, W)
         locations = grid[None, :, :, None, None] + offset
