@@ -2130,8 +2130,10 @@ class BRA_Wrapper(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
+        # === FP16-Safe Attention ===
+        attn = (q.float() @ k.float().transpose(-2, -1)) * self.scale
+        attn = attn.clamp(min=-50.0, max=50.0)
+        attn = attn.softmax(dim=-1).to(q.dtype)
         
         out = (attn @ v).transpose(1, 2).reshape(B * num_regions, -1, C)
         out = self.proj(out)
@@ -2140,8 +2142,7 @@ class BRA_Wrapper(nn.Module):
         out = out.permute(0, 1, 3, 2, 4, 5).contiguous()
         out = out.view(B, H, W, C)
         
-        out = out.permute(0, 3, 1, 2).contiguous()
-        return out
+        return out.permute(0, 3, 1, 2).contiguous()
 
 class AKConv(nn.Module):
     def __init__(self, c1, c2, k=5, s=1, p=None, g=1):
@@ -2156,52 +2157,58 @@ class AKConv(nn.Module):
             nn.GELU(),
             nn.Conv2d(c1, 2 * self.num_param, kernel_size=1, bias=True)
         )
-        nn.init.constant_(self.offset_conv[-1].weight, 0)
-        nn.init.constant_(self.offset_conv[-1].bias, 0)
         
-        self.weight = nn.Parameter(torch.randn(c2, c1 // g, self.num_param))
+        # === CRITICAL FIX (Fix 2): Zero-init hoàn toàn offset network ===
+        nn.init.zeros_(self.offset_conv[-1].weight)
+        nn.init.zeros_(self.offset_conv[-1].bias)
+        
+        self.weight = nn.Parameter(torch.empty(c2, c1 // g, self.num_param))
         nn.init.kaiming_normal_(self.weight, mode='fan_out', nonlinearity='relu')
         self.groups = g
         
     def forward(self, x):
+        import torch
+        import torch.nn.functional as F
+        import math
+        
         B, C, H, W = x.shape
         offset = self.offset_conv(x)
-        offset = torch.tanh(offset) * 2.0
+        
+        # === Clamp chặt hơn (Fix 3) ===
+        offset = torch.tanh(offset) * 1.5
         
         k = int(math.sqrt(self.num_param))
-        p = k // 2
+        p_k = k // 2
         grid = torch.stack(torch.meshgrid(
-            torch.arange(-p, p + 1, device=x.device),
-            torch.arange(-p, p + 1, device=x.device),
+            torch.arange(-p_k, p_k + 1, device=x.device),
+            torch.arange(-p_k, p_k + 1, device=x.device),
             indexing='ij'
         ), dim=-1).to(x.dtype).reshape(-1, 2)
         
         offset = offset.view(B, self.num_param, 2, H, W)
         locations = grid[None, :, :, None, None] + offset
         
-        locations[..., 0, :, :] = 2.0 * locations[..., 0, :, :] / (W - 1) - 1.0
-        locations[..., 1, :, :] = 2.0 * locations[..., 1, :, :] / (H - 1) - 1.0
+        locations[..., 0, :, :] = 2.0 * locations[..., 0, :, :] / max(W - 1, 1) - 1.0
+        locations[..., 1, :, :] = 2.0 * locations[..., 1, :, :] / max(H - 1, 1) - 1.0
+        locations = locations.clamp(-1.0, 1.0)
+        
         locations = locations.permute(0, 3, 4, 1, 2).contiguous()
         
         sampled_features = []
         for i in range(self.num_param):
-            sampled = F.grid_sample(x, locations[..., i, :], mode='bilinear', padding_mode='zeros', align_corners=True)
+            sampled = F.grid_sample(
+                x, 
+                locations[..., i, :], 
+                mode='bilinear', 
+                padding_mode='border', # === Border padding thay vì Zeros (Fix 4) ===
+                align_corners=True
+            )
             sampled_features.append(sampled)
             
         sampled_features = torch.stack(sampled_features, dim=-1)
-        sampled_features = sampled_features.view(B, C, H * W, self.num_param).permute(0, 2, 1, 3)
-        out = torch.einsum('bhci,oci->bho', sampled_features, self.weight)
-        return out.view(B, H, W, -1).permute(0, 3, 1, 2)
-
-class C2f_AKConv(nn.Module):
-    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
-        super().__init__()
-        self.c = int(c2 * e)
-        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
-        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(n))
-        self.cv2 = AKConv(self.c * (2 + n), c2, k=5, s=1)
+        sampled_features = sampled_features.view(B, C, H * W, self.num_param)
+        sampled_features = sampled_features.permute(0, 2, 1, 3)
         
-    def forward(self, x):
-        y = list(self.cv1(x).split((self.c, self.c), 1))
-        y.extend(m(y[-1]) for m in self.m)
-        return self.cv2(torch.cat(y, 1))
+        # === Einsum an toàn trên FP32 (Fix 5) ===
+        out = torch.einsum('bhci,oci->bho', sampled_features.float(), self.weight.float()).to(x.dtype)
+        return out.view(B, H, W, -1).permute(0, 3, 1, 2)

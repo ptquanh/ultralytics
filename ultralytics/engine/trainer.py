@@ -730,9 +730,17 @@ class BaseTrainer:
         return ckpt
 
     def optimizer_step(self):
-        """Perform a single step of the training optimizer with gradient clipping and EMA update."""
-        self.scaler.unscale_(self.optimizer)  # unscale gradients
+        """Perform a single step of the training optimizer with gradient clipping."""
+        self.scaler.unscale_(self.optimizer)  # Giải nén gradient từ AMP
+        
+        # Cắt ngọn Gradient (Chống bùng nổ đạo hàm cho AKConv & Attention)
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
+        
+        # Trinh sát NaN (Phát hiện và tiêu diệt ngay lập tức)
+        for name, param in self.model.named_parameters():
+            if param.grad is not None and torch.isnan(param.grad).any():
+                param.grad = torch.zeros_like(param.grad)
+                
         self.scaler.step(self.optimizer)
         self.scaler.update()
         self.optimizer.zero_grad()
