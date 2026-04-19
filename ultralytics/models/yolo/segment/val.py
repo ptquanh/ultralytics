@@ -165,6 +165,8 @@ class SegmentationValidator(DetectionValidator):
         if gt_cls.shape[0] == 0 or preds["cls"].shape[0] == 0:
             tp_m = np.zeros((preds["cls"].shape[0], self.niou), dtype=bool)
         else:
+            if batch["masks"].shape[1:] != preds["masks"].shape[1:]:
+                batch["masks"] = F.interpolate(batch["masks"].unsqueeze(1).float(), size=preds["masks"].shape[1:], mode="nearest").squeeze(1)
             iou = mask_iou(batch["masks"].flatten(1), preds["masks"].flatten(1).float())  # float, uint8
             tp_m = self.match_predictions(preds["cls"], gt_cls, iou).cpu().numpy()
         tp.update({"tp_m": tp_m})  # update tp with mask IoU
