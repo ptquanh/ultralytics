@@ -2158,7 +2158,7 @@ class AKConv(nn.Module):
             nn.Conv2d(c1, 2 * self.num_param, kernel_size=1, bias=True)
         )
         
-        # === CRITICAL FIX (Fix 2): Zero-init hoàn toàn offset network ===
+        # === CRITICAL: Zero-init offset hoàn toàn ===
         nn.init.zeros_(self.offset_conv[-1].weight)
         nn.init.zeros_(self.offset_conv[-1].bias)
         
@@ -2167,14 +2167,10 @@ class AKConv(nn.Module):
         self.groups = g
         
     def forward(self, x):
-        import torch
-        import torch.nn.functional as F
-        import math
-        
         B, C, H, W = x.shape
         offset = self.offset_conv(x)
         
-        # === Clamp chặt hơn (Fix 3) ===
+        # Clamp chặt hơn
         offset = torch.tanh(offset) * 1.5
         
         k = int(math.sqrt(self.num_param))
@@ -2200,7 +2196,7 @@ class AKConv(nn.Module):
                 x, 
                 locations[..., i, :], 
                 mode='bilinear', 
-                padding_mode='border', # === Border padding thay vì Zeros (Fix 4) ===
+                padding_mode='border', 
                 align_corners=True
             )
             sampled_features.append(sampled)
@@ -2209,6 +2205,18 @@ class AKConv(nn.Module):
         sampled_features = sampled_features.view(B, C, H * W, self.num_param)
         sampled_features = sampled_features.permute(0, 2, 1, 3)
         
-        # === Einsum an toàn trên FP32 (Fix 5) ===
         out = torch.einsum('bhci,oci->bho', sampled_features.float(), self.weight.float()).to(x.dtype)
         return out.view(B, H, W, -1).permute(0, 3, 1, 2)
+
+class C2f_AKConv(nn.Module):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__()
+        self.c = int(c2 * e)
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(n))
+        self.cv2 = AKConv(self.c * (2 + n), c2, k=5, s=1)
+        
+    def forward(self, x):
+        y = list(self.cv1(x).split((self.c, self.c), 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
